@@ -3,7 +3,8 @@ import time
 import math
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
+
+from torchtext.data import TabularDataset, Field, Iterator, BucketIterator
 
 import data
 import model
@@ -22,16 +23,14 @@ parser.add_argument('--nhid', type=int, default=200,
                     help='number of hidden units per layer')
 parser.add_argument('--nlayers', type=int, default=2,
                     help='number of layers')
-parser.add_argument('--lr', type=float, default=20,
+parser.add_argument('--lr', type=float, default=0.001,
                     help='initial learning rate')
 parser.add_argument('--clip', type=float, default=0.25,
                     help='gradient clipping')
 parser.add_argument('--epochs', type=int, default=40,
                     help='upper epoch limit')
-parser.add_argument('--batch_size', type=int, default=20, metavar='N',
+parser.add_argument('--batch_size', type=int, default=256, metavar='N',
                     help='batch size')
-parser.add_argument('--bptt', type=int, default=35,
-                    help='sequence length')
 parser.add_argument('--dropout', type=float, default=0.2,
                     help='dropout applied to layers (0 = no dropout)')
 parser.add_argument('--tied', action='store_true',
@@ -54,42 +53,45 @@ if torch.cuda.is_available():
     else:
         torch.cuda.manual_seed(args.seed)
 
+# Load checkpoint
+build_vocab = False
+if args.checkpoint != '':
+    print(f'Loading field from {args.checkpoint}')
+    save_dict = torch.load(args.checkpoint)
+    field = save_dict['field']
+else:
+    save_dict = None
+    field = Field(init_token='<init>')
+    build_vocab = True
+
 ###############################################################################
 # Load data
 ###############################################################################
 
-corpus = data.Corpus(args.data)
+train_data, val_data, test_data = TabularDataset.splits(path=args.data, train='train.txt', validation='valid.txt', test='test.txt',
+                                                        format='tsv', fields=[('text', field)])
+print(train_data, len(train_data), val_data, len(val_data), test_data, len(test_data))
+if build_vocab:
+    field.eos_token = '<eos>'
+    field.build_vocab(train_data, val_data)
+    field.eos_token = None
+eos_id = field.vocab.stoi['<eos>']
+pad_id = field.vocab.stoi[field.pad_token]
 
-def batchify(data, bsz):
-    # Work out how cleanly we can divide the dataset into bsz parts.
-    nbatch = data.size(0) // bsz
-    # Trim off any extra elements that wouldn't cleanly fit (remainders).
-    data = data.narrow(0, 0, nbatch * bsz)
-    # Evenly divide the data across the bsz batches.
-    data = data.view(bsz, -1).t().contiguous()
-    if args.cuda:
-        data = data.cuda()
-    return data
-
-eval_batch_size = 10
-train_data = batchify(corpus.train, args.batch_size)
-val_data = batchify(corpus.valid, eval_batch_size)
-test_data = batchify(corpus.test, eval_batch_size)
+train_iter = BucketIterator(train_data, args.batch_size, train=True, repeat=False)
+val_iter = Iterator(val_data, args.batch_size, repeat=False)
+test_iter = Iterator(test_data, args.batch_size, repeat=False)
+print(train_iter, len(train_iter), val_iter, len(val_iter), test_iter, len(test_iter))
 
 ###############################################################################
 # Build the model
 ###############################################################################
 
-ntokens = len(corpus.dictionary)
+ntokens = len(field.vocab)
 model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout, args.tied)
 
-# Load checkpoint
-if args.checkpoint != '':
-    if args.cuda:
-        model = torch.load(args.checkpoint)
-    else:
-        # Load GPU model on CPU
-        model = torch.load(args.checkpoint, map_location=lambda storage, loc: storage)
+if save_dict is not None:
+    model.load_state_dict(save_dict['model'])
 
 if args.cuda:
     model.cuda()
@@ -97,42 +99,41 @@ else:
     model.cpu()
 print (model)
 
-criterion = nn.CrossEntropyLoss()
-if args.cuda:
-    criterion.cuda()
+if save_dict:
+    opt = save_dict['optimizer']
+else:
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
 ###############################################################################
 # Training code
 ###############################################################################
 
-def repackage_hidden(h):
-    """Wraps hidden states in new Variables, to detach them from their history."""
-    if type(h) == Variable:
-        return Variable(h.data)
-    else:
-        return tuple(repackage_hidden(v) for v in h)
+criterion = torch.nn.CrossEntropyLoss(ignore_index=pad_id)
 
+def make_target(text):
+    batch_size = text.size()[1]
+    eos_vector = torch.full((1, batch_size), eos_id, dtype=text.dtype)
+    target = torch.cat((text[1:], eos_vector), dim=0)
+    return target
 
-def get_batch(source, i, evaluation=False):
-    seq_len = min(args.bptt, len(source) - 1 - i)
-    data = Variable(source[i:i+seq_len], volatile=evaluation)
-    target = Variable(source[i+1:i+1+seq_len].view(-1))
-    return data, target
+def compute_loss(output, text):
+    output_flat = output.view(-1, ntokens)
+    target = make_target(text)
+    target_flat = target.view(-1)
 
+    return criterion(output_flat, target_flat)
 
 def evaluate(data_source):
     # Turn on evaluation mode which disables dropout.
-    model.eval()
-    total_loss = 0
-    ntokens = len(corpus.dictionary)
-    hidden = model.init_hidden(eval_batch_size)
-    for i in range(0, data_source.size(0) - 1, args.bptt):
-        data, targets = get_batch(data_source, i, evaluation=True)
-        output, hidden = model(data, hidden)
-        output_flat = output.view(-1, ntokens)
-        total_loss += len(data) * criterion(output_flat, targets).data
-        hidden = repackage_hidden(hidden)
-    return total_loss[0] / len(data_source)
+    with torch.no_grad():
+        model.eval()
+        total_loss = 0
+        for batch in data_source:
+            output, hidden = model(batch.text)
+            loss = compute_loss(output, batch.text)
+
+            total_loss += loss.detach().numpy()
+        return total_loss / len(data_source)
 
 
 def train():
@@ -140,37 +141,32 @@ def train():
     model.train()
     total_loss = 0
     start_time = time.time()
-    ntokens = len(corpus.dictionary)
-    hidden = model.init_hidden(args.batch_size)
-    for batch, i in enumerate(range(0, train_data.size(0) - 1, args.bptt)):
-        data, targets = get_batch(train_data, i)
-        # Starting each batch, we detach the hidden state from how it was previously produced.
-        # If we didn't, the model would try backpropagating all the way to start of the dataset.
-        hidden = repackage_hidden(hidden)
+    for i, batch in enumerate(train_iter):
         model.zero_grad()
-        output, hidden = model(data, hidden)
-        loss = criterion(output.view(-1, ntokens), targets)
+
+        output, hidden = model(batch.text)
+        target = make_target(batch.text)
+
+        loss = compute_loss(output, batch.text)
         loss.backward()
 
         # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
-        torch.nn.utils.clip_grad_norm(model.parameters(), args.clip)
-        for p in model.parameters():
-            p.data.add_(-lr, p.grad.data)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+        opt.step()
 
-        total_loss += loss.data
+        total_loss += loss.detach().numpy()
 
-        if batch % args.log_interval == 0 and batch > 0:
-            cur_loss = total_loss[0] / args.log_interval
+        if i % args.log_interval == 0 and i > 0:
+            cur_loss = total_loss / args.log_interval
             elapsed = time.time() - start_time
-            print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.2f} | ms/batch {:5.2f} | '
+            print('| epoch {:3d} | {:5d}/{:5d} batches | ms/batch {:5.2f} | '
                     'loss {:5.2f} | ppl {:8.2f}'.format(
-                epoch, batch, len(train_data) // args.bptt, lr,
+                epoch, i, len(train_iter),
                 elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss)))
             total_loss = 0
             start_time = time.time()
 
 # Loop over epochs.
-lr = args.lr
 best_val_loss = None
 
 # At any point you can hit Ctrl + C to break out of training early.
@@ -178,7 +174,7 @@ try:
     for epoch in range(1, args.epochs+1):
         epoch_start_time = time.time()
         train()
-        val_loss = evaluate(val_data)
+        val_loss = evaluate(val_iter)
         print('-' * 89)
         print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
                 'valid ppl {:8.2f}'.format(epoch, (time.time() - epoch_start_time),
@@ -187,21 +183,26 @@ try:
         # Save the model if the validation loss is the best we've seen so far.
         if not best_val_loss or val_loss < best_val_loss:
             with open(args.save, 'wb') as f:
-                torch.save(model, f)
+                torch.save(dict(field=field, model=model.state_dict(), optimizer=opt), f)
             best_val_loss = val_loss
-        else:
-            # Anneal the learning rate if no improvement has been seen in the validation dataset.
-            lr /= 4.0
 except KeyboardInterrupt:
     print('-' * 89)
     print('Exiting from training early')
 
 # Load the best saved model.
 with open(args.save, 'rb') as f:
-    model = torch.load(f)
+    save_dict = torch.load(f)
+    field = save_dict['field']
+    if save_dict is not None:
+        model.load_state_dict(save_dict['model'])
+
+    if args.cuda:
+        model.cuda()
+    else:
+        model.cpu()
 
 # Run on test data.
-test_loss = evaluate(test_data)
+test_loss = evaluate(test_iter)
 print('=' * 89)
 print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(
     test_loss, math.exp(test_loss)))

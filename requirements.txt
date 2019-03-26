@@ -1,0 +1,5 @@
+numpy
+torch>=0.4.1,<2.0.0
+tqdm
+nltk==3.2.5
+torchtext
