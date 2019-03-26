@@ -3,6 +3,7 @@ import time
 import math
 import torch
 import torch.nn as nn
+import dill
 
 from torchtext.data import TabularDataset, Field, Iterator, BucketIterator
 
@@ -57,12 +58,14 @@ if torch.cuda.is_available():
 build_vocab = False
 if args.checkpoint != '':
     print(f'Loading field from {args.checkpoint}')
-    save_dict = torch.load(args.checkpoint)
+    save_dict = torch.load(args.checkpoint, pickle_module=dill)
     field = save_dict['field']
+    start_epoch = save_dict['start_epoch']
 else:
     save_dict = None
     field = Field(init_token='<init>')
     build_vocab = True
+    start_epoch = 0
 
 ###############################################################################
 # Load data
@@ -103,6 +106,9 @@ if save_dict:
     opt = save_dict['optimizer']
 else:
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+with open(args.save, 'wb') as f:
+    torch.save(dict(field=field, model=model.state_dict(), optimizer=opt, start_epoch=start_epoch), f, pickle_module=dill)
 
 ###############################################################################
 # Training code
@@ -171,7 +177,7 @@ best_val_loss = None
 
 # At any point you can hit Ctrl + C to break out of training early.
 try:
-    for epoch in range(1, args.epochs+1):
+    for epoch in range(start_epoch, args.epochs+1):
         epoch_start_time = time.time()
         train()
         val_loss = evaluate(val_iter)
@@ -183,7 +189,7 @@ try:
         # Save the model if the validation loss is the best we've seen so far.
         if not best_val_loss or val_loss < best_val_loss:
             with open(args.save, 'wb') as f:
-                torch.save(dict(field=field, model=model.state_dict(), optimizer=opt), f)
+                torch.save(dict(field=field, model=model.state_dict(), optimizer=opt, start_epoch=0), f, pickle_module=dill)
             best_val_loss = val_loss
 except KeyboardInterrupt:
     print('-' * 89)
@@ -191,7 +197,7 @@ except KeyboardInterrupt:
 
 # Load the best saved model.
 with open(args.save, 'rb') as f:
-    save_dict = torch.load(f)
+    save_dict = torch.load(f, pickle_module=dill)
     field = save_dict['field']
     if save_dict is not None:
         model.load_state_dict(save_dict['model'])
