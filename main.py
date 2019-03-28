@@ -180,7 +180,7 @@ def main():
 
     # At any point you can hit Ctrl + C to break out of training early.
     try:
-        for epoch in range(start_epoch, args.epochs+1):
+        for epoch in range(start_epoch, args.epochs):
             epoch_start_time = time.time()
             train()
             val_loss = evaluate(val_iter)
