@@ -3,12 +3,14 @@ import time
 import math
 import torch
 import torch.nn as nn
-import dill
 
 from torchtext.data import TabularDataset, Field, Iterator, BucketIterator
 
 import data
 from model import RNNModel
+
+def split_tokenize(x):
+    return x.split()
 
 def main():
     # Add ckp
@@ -57,14 +59,14 @@ def main():
 
     # Load checkpoint
     build_vocab = False
-    if args.checkpoint != '':
+    if args.checkpoint != '' and os.path.exists(args.checkpoint):
         print(f'Loading field from {args.checkpoint}')
-        save_dict = torch.load(args.checkpoint, pickle_module=dill)
+        save_dict = torch.load(args.checkpoint)
         field = save_dict['field']
         start_epoch = save_dict['start_epoch']
     else:
         save_dict = None
-        field = Field(init_token='<init>')
+        field = Field(tokenize=split_tokenize, init_token='<init>')
         build_vocab = True
         start_epoch = 0
 
@@ -77,14 +79,14 @@ def main():
     print(train_data, len(train_data), val_data, len(val_data), test_data, len(test_data))
     if build_vocab:
         field.eos_token = '<eos>'
-        field.build_vocab(train_data, val_data, min_freq=10000)
+        field.build_vocab(train_data, val_data, min_freq=1000)
         field.eos_token = None
     eos_id = field.vocab.stoi['<eos>']
     pad_id = field.vocab.stoi[field.pad_token]
 
-    train_iter = BucketIterator(train_data, args.batch_size, train=True, repeat=False)
-    val_iter = Iterator(val_data, args.batch_size, repeat=False)
-    test_iter = Iterator(test_data, args.batch_size, repeat=False)
+    train_iter = BucketIterator(train_data, args.batch_size, train=True, repeat=False, device='cuda:0' if args.cuda else 'cpu:0')
+    val_iter = Iterator(val_data, args.batch_size, repeat=False, device='cuda:0' if args.cuda else 'cpu:0')
+    test_iter = Iterator(test_data, args.batch_size, repeat=False, device='cuda:0' if args.cuda else 'cpu:0')
     print(train_iter, len(train_iter), val_iter, len(val_iter), test_iter, len(test_iter))
 
     ###############################################################################
@@ -108,8 +110,8 @@ def main():
     else:
         opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    with open(args.save, 'wb') as f:
-        torch.save(dict(field=field, model=model.state_dict(), optimizer=opt, start_epoch=start_epoch), f, pickle_module=dill)
+    if args.checkpoint:
+        torch.save(dict(field=field, model=model.state_dict(), optimizer=opt, start_epoch=start_epoch), args.checkpoint)
 
     ###############################################################################
     # Training code
@@ -119,7 +121,7 @@ def main():
 
     def make_target(text):
         batch_size = text.size()[1]
-        eos_vector = torch.full((1, batch_size), eos_id, dtype=text.dtype)
+        eos_vector = torch.full((1, batch_size), eos_id, dtype=text.dtype, device='cuda:0' if args.cuda else 'cpu:0')
         target = torch.cat((text[1:], eos_vector), dim=0)
         return target
 
@@ -139,7 +141,7 @@ def main():
                 output, hidden = model(batch.text)
                 loss = compute_loss(output, batch.text)
 
-                total_loss += loss.detach().numpy()
+                total_loss += loss.item()
             return total_loss / len(data_source)
 
 
@@ -161,7 +163,7 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
             opt.step()
 
-            total_loss += loss.detach().numpy()
+            total_loss += loss.item()
 
             if i % args.log_interval == 0 and i > 0:
                 cur_loss = total_loss / args.log_interval
@@ -189,24 +191,28 @@ def main():
             print('-' * 89)
             # Save the model if the validation loss is the best we've seen so far.
             if not best_val_loss or val_loss < best_val_loss:
-                with open(args.save, 'wb') as f:
-                    torch.save(dict(field=field, model=model.state_dict(), optimizer=opt, start_epoch=0), f, pickle_module=dill)
+                if args.checkpoint:
+                    torch.save(dict(field=field, model=model.state_dict(), optimizer=opt, start_epoch=epoch), args.checkpoint)
                 best_val_loss = val_loss
     except KeyboardInterrupt:
         print('-' * 89)
         print('Exiting from training early')
 
-    # Load the best saved model.
-    with open(args.save, 'rb') as f:
-        save_dict = torch.load(f, pickle_module=dill)
-        field = save_dict['field']
-        if save_dict is not None:
-            model.load_state_dict(save_dict['model'])
+    torch.save(dict(vocab=field.vocab.itos, model=model.state_dict(),
+                    settings=dict(rnn_type=args.model, emsize=args.emsize, nhid=args.nhid, nlayers=args.nlayers)),
+               args.save)
 
-        if args.cuda:
-            model.cuda()
-        else:
-            model.cpu()
+    # Load the best saved model.
+    #with open(args.save, 'rb') as f:
+    #    save_dict = torch.load(f)
+    #    field = save_dict['field']
+    #    if save_dict is not None:
+    #        model.load_state_dict(save_dict['model'])
+    #
+    #    if args.cuda:
+    #        model.cuda()
+    #    else:
+    #        model.cpu()
 
     # Run on test data.
     test_loss = evaluate(test_iter)
